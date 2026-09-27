@@ -22,12 +22,15 @@ from ..domain.models import (
     MaterialVersion,
     Objection,
     PackageEntry,
+    PolicyCase,
+    PolicyRule,
+    PolicyVersion,
     ReviewPackage,
     ReviewRequest,
     User,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class SqliteRepository(Repository):
@@ -51,6 +54,12 @@ class SqliteRepository(Repository):
         version = self._conn.execute("PRAGMA user_version").fetchone()[0]
         if version >= SCHEMA_VERSION:
             return
+        if version < 1:
+            self._migrate_v1()
+        if version < 2:
+            self._migrate_v2()
+
+    def _migrate_v1(self) -> None:
         # executescript 会自行提交事务；把 user_version 写入放在同一脚本
         self._conn.executescript(
             """
@@ -177,6 +186,45 @@ class SqliteRepository(Repository):
                 );
 
                 PRAGMA user_version = 1;
+            """
+        )
+
+    def _migrate_v2(self) -> None:
+        # 策略版本比较：规则顺序（position）与依赖（depends_on_json）随版本固定
+        self._conn.executescript(
+            """
+                CREATE TABLE IF NOT EXISTS policy_versions (
+                    version_id TEXT PRIMARY KEY,
+                    policy_id  TEXT NOT NULL,
+                    version_no INTEGER NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(policy_id, version_no)
+                );
+
+                CREATE TABLE IF NOT EXISTS policy_rules (
+                    version_id      TEXT NOT NULL
+                        REFERENCES policy_versions(version_id),
+                    rule_id         TEXT NOT NULL,
+                    position        INTEGER NOT NULL,
+                    content         TEXT NOT NULL,
+                    depends_on_json TEXT NOT NULL DEFAULT '[]',
+                    PRIMARY KEY(version_id, rule_id),
+                    UNIQUE(version_id, position)
+                );
+
+                CREATE TABLE IF NOT EXISTS policy_cases (
+                    case_id        TEXT PRIMARY KEY,
+                    policy_id      TEXT NOT NULL,
+                    rule_id        TEXT NOT NULL,
+                    institution_id TEXT NOT NULL,
+                    status         TEXT NOT NULL,
+                    created_at     TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_policy_cases_policy
+                    ON policy_cases(policy_id, rule_id);
+
+                PRAGMA user_version = 2;
             """
         )
 
@@ -667,6 +715,114 @@ class SqliteRepository(Repository):
             for r in rows
         ]
 
+    # ------------------------------------------------------- policy versions
+    def insert_policy_version(self, version: PolicyVersion) -> None:
+        with self.transaction():
+            self._conn.execute(
+                "INSERT INTO policy_versions(version_id, policy_id, version_no,"
+                " created_by, created_at) VALUES(?,?,?,?,?)",
+                (
+                    version.version_id,
+                    version.policy_id,
+                    version.version_no,
+                    version.created_by,
+                    version.created_at,
+                ),
+            )
+            for rule in version.rules:
+                self._conn.execute(
+                    "INSERT INTO policy_rules(version_id, rule_id, position,"
+                    " content, depends_on_json) VALUES(?,?,?,?,?)",
+                    (
+                        version.version_id,
+                        rule.rule_id,
+                        rule.position,
+                        rule.content,
+                        json.dumps(list(rule.depends_on), ensure_ascii=False),
+                    ),
+                )
+
+    def get_policy_version(self, version_id: str) -> PolicyVersion | None:
+        row = self._conn.execute(
+            "SELECT * FROM policy_versions WHERE version_id = ?", (version_id,)
+        ).fetchone()
+        return None if row is None else self._row_to_policy_version(row)
+
+    def get_policy_version_by_no(
+        self, policy_id: str, version_no: int
+    ) -> PolicyVersion | None:
+        row = self._conn.execute(
+            "SELECT * FROM policy_versions WHERE policy_id = ? AND version_no = ?",
+            (policy_id, version_no),
+        ).fetchone()
+        return None if row is None else self._row_to_policy_version(row)
+
+    def latest_policy_version(self, policy_id: str) -> PolicyVersion | None:
+        row = self._conn.execute(
+            "SELECT * FROM policy_versions WHERE policy_id = ?"
+            " ORDER BY version_no DESC LIMIT 1",
+            (policy_id,),
+        ).fetchone()
+        return None if row is None else self._row_to_policy_version(row)
+
+    def list_policy_versions(self, policy_id: str) -> list[PolicyVersion]:
+        rows = self._conn.execute(
+            "SELECT * FROM policy_versions WHERE policy_id = ?"
+            " ORDER BY version_no",
+            (policy_id,),
+        ).fetchall()
+        return [self._row_to_policy_version(r) for r in rows]
+
+    def _row_to_policy_version(self, row: sqlite3.Row) -> PolicyVersion:
+        rules = self._conn.execute(
+            "SELECT * FROM policy_rules WHERE version_id = ? ORDER BY position",
+            (row["version_id"],),
+        ).fetchall()
+        return PolicyVersion(
+            version_id=row["version_id"],
+            policy_id=row["policy_id"],
+            version_no=row["version_no"],
+            rules=tuple(
+                PolicyRule(
+                    rule_id=r["rule_id"],
+                    position=r["position"],
+                    content=r["content"],
+                    depends_on=tuple(json.loads(r["depends_on_json"])),
+                )
+                for r in rules
+            ),
+            created_by=row["created_by"],
+            created_at=row["created_at"],
+        )
+
+    # ------------------------------------------------------------------ cases
+    def insert_case(self, case: PolicyCase) -> None:
+        self._conn.execute(
+            "INSERT INTO policy_cases(case_id, policy_id, rule_id,"
+            " institution_id, status, created_at) VALUES(?,?,?,?,?,?)",
+            (
+                case.case_id,
+                case.policy_id,
+                case.rule_id,
+                case.institution_id,
+                case.status,
+                case.created_at,
+            ),
+        )
+
+    def get_case(self, case_id: str) -> PolicyCase | None:
+        row = self._conn.execute(
+            "SELECT * FROM policy_cases WHERE case_id = ?", (case_id,)
+        ).fetchone()
+        return None if row is None else _row_to_case(row)
+
+    def list_cases_by_policy(self, policy_id: str) -> list[PolicyCase]:
+        rows = self._conn.execute(
+            "SELECT * FROM policy_cases WHERE policy_id = ? ORDER BY case_id",
+            (policy_id,),
+        ).fetchall()
+        return [_row_to_case(r) for r in rows]
+
 
 def _row_to_user(row: sqlite3.Row) -> User:
     return User(
@@ -716,4 +872,15 @@ def _row_to_entry(row: sqlite3.Row) -> PackageEntry:
         kind=row["kind"],
         sensitivity=row["sensitivity"],
         added_at=row["added_at"],
+    )
+
+
+def _row_to_case(row: sqlite3.Row) -> PolicyCase:
+    return PolicyCase(
+        case_id=row["case_id"],
+        policy_id=row["policy_id"],
+        rule_id=row["rule_id"],
+        institution_id=row["institution_id"],
+        status=row["status"],
+        created_at=row["created_at"],
     )

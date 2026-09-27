@@ -16,6 +16,8 @@ from ..domain.models import (
     MaterialVersion,
     Objection,
     PackageEntry,
+    PolicyCase,
+    PolicyVersion,
     ReviewPackage,
     ReviewRequest,
     User,
@@ -148,3 +150,31 @@ class Repository(abc.ABC):
     def list_audit(
         self, package_id: str | None = None, limit: int = 200
     ) -> list[AuditEntry]: ...
+
+    # ---- 策略版本与规则（顺序与依赖随版本固定保存） ----
+    @abc.abstractmethod
+    def insert_policy_version(self, version: PolicyVersion) -> None: ...
+
+    @abc.abstractmethod
+    def get_policy_version(self, version_id: str) -> PolicyVersion | None: ...
+
+    @abc.abstractmethod
+    def get_policy_version_by_no(
+        self, policy_id: str, version_no: int
+    ) -> PolicyVersion | None: ...
+
+    @abc.abstractmethod
+    def latest_policy_version(self, policy_id: str) -> PolicyVersion | None: ...
+
+    @abc.abstractmethod
+    def list_policy_versions(self, policy_id: str) -> list[PolicyVersion]: ...
+
+    # ---- 案件 ----
+    @abc.abstractmethod
+    def insert_case(self, case: PolicyCase) -> None: ...
+
+    @abc.abstractmethod
+    def get_case(self, case_id: str) -> PolicyCase | None: ...
+
+    @abc.abstractmethod
+    def list_cases_by_policy(self, policy_id: str) -> list[PolicyCase]: ...

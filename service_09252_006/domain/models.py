@@ -146,5 +146,39 @@ class AuditEntry:
     detail: dict = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class PolicyRule:
+    """策略版本内的一条规则；position 为版本内顺序（从 1 开始）。"""
+
+    rule_id: str
+    position: int
+    content: str
+    depends_on: tuple[str, ...] = ()  # 同一版本内其他 rule_id
+
+
+@dataclass(frozen=True)
+class PolicyVersion:
+    """策略的一次不可变版本：规则顺序与依赖随版本固定保存。"""
+
+    version_id: str
+    policy_id: str
+    version_no: int
+    rules: tuple[PolicyRule, ...]     # 按 position 升序
+    created_by: str
+    created_at: str
+
+
+@dataclass
+class PolicyCase:
+    """受策略约束的案件：绑定到某条规则，规则变化时案件受影响。"""
+
+    case_id: str
+    policy_id: str
+    rule_id: str
+    institution_id: str
+    status: str
+    created_at: str
+
+
 def asdict(obj) -> dict:
     return dataclasses.asdict(obj)
