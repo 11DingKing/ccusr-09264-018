@@ -20,6 +20,7 @@ from ..domain.models import (
     ReviewRequest,
     User,
 )
+from ..domain.strategy import RuleStrategy, StrategyCase, StrategyVersion
 
 
 class Repository(abc.ABC):
@@ -148,3 +149,30 @@ class Repository(abc.ABC):
     def list_audit(
         self, package_id: str | None = None, limit: int = 200
     ) -> list[AuditEntry]: ...
+
+    # ---- 规则策略（版本保留顺序与依赖） ----
+    @abc.abstractmethod
+    def insert_strategy(self, strategy: RuleStrategy) -> None: ...
+
+    @abc.abstractmethod
+    def get_strategy(self, strategy_id: str) -> RuleStrategy | None: ...
+
+    @abc.abstractmethod
+    def insert_strategy_version(self, version: StrategyVersion) -> None: ...
+
+    @abc.abstractmethod
+    def get_strategy_version(self, version_id: str) -> StrategyVersion | None:
+        """含规则（按 position 升序）与依赖；不存在返回 None。"""
+
+    @abc.abstractmethod
+    def list_strategy_versions(self, strategy_id: str) -> list[StrategyVersion]: ...
+
+    @abc.abstractmethod
+    def insert_strategy_case(self, case: StrategyCase) -> None: ...
+
+    @abc.abstractmethod
+    def get_strategy_case(self, case_id: str) -> StrategyCase | None: ...
+
+    @abc.abstractmethod
+    def list_cases_by_version(self, version_id: str) -> list[StrategyCase]:
+        """在某策略版本下决定的案件（比较受影响案件的数据来源）。"""

@@ -26,8 +26,199 @@ from ..domain.models import (
     ReviewRequest,
     User,
 )
+from ..domain.strategy import (
+    RuleStrategy,
+    StrategyCase,
+    StrategyRule,
+    StrategyVersion,
+)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+_SCHEMA_V1 = """
+    CREATE TABLE IF NOT EXISTS users (
+        user_id        TEXT PRIMARY KEY,
+        institution_id TEXT,
+        roles_json     TEXT NOT NULL,
+        display_name   TEXT NOT NULL DEFAULT ''
+    );
+
+    CREATE TABLE IF NOT EXISTS blobs (
+        sha256     TEXT PRIMARY KEY,
+        data       BLOB NOT NULL,
+        media_type TEXT NOT NULL,
+        size       INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS materials (
+        material_id        TEXT PRIMARY KEY,
+        institution_id     TEXT NOT NULL,
+        kind               TEXT NOT NULL,
+        sensitivity        TEXT NOT NULL,
+        title              TEXT NOT NULL,
+        current_version_id TEXT,
+        withdrawn          INTEGER NOT NULL DEFAULT 0,
+        created_at         TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS versions (
+        version_id              TEXT PRIMARY KEY,
+        material_id             TEXT NOT NULL REFERENCES materials(material_id),
+        institution_id          TEXT NOT NULL,
+        sha256                  TEXT NOT NULL,
+        size                    INTEGER NOT NULL,
+        media_type              TEXT NOT NULL,
+        version_no              INTEGER NOT NULL,
+        supersedes_version_id   TEXT,
+        created_by              TEXT NOT NULL,
+        created_at              TEXT NOT NULL,
+        withdrawn               INTEGER NOT NULL DEFAULT 0,
+        withdrawn_at            TEXT,
+        UNIQUE(material_id, version_no)
+    );
+
+    CREATE TABLE IF NOT EXISTS packages (
+        package_id            TEXT PRIMARY KEY,
+        institution_id        TEXT NOT NULL,
+        title                 TEXT NOT NULL,
+        status                TEXT NOT NULL,
+        created_by            TEXT NOT NULL,
+        created_at            TEXT NOT NULL,
+        sealed_at             TEXT,
+        manifest_fingerprint  TEXT,
+        decided_at            TEXT,
+        decision              TEXT,
+        decision_note         TEXT,
+        review_fingerprint    TEXT,
+        supersedes_package_id TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS entries (
+        entry_id    TEXT PRIMARY KEY,
+        package_id  TEXT NOT NULL REFERENCES packages(package_id),
+        material_id TEXT NOT NULL,
+        version_id  TEXT NOT NULL REFERENCES versions(version_id),
+        sha256      TEXT NOT NULL,
+        kind        TEXT NOT NULL,
+        sensitivity TEXT NOT NULL,
+        added_at    TEXT NOT NULL,
+        UNIQUE(package_id, version_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS requests (
+        request_id       TEXT PRIMARY KEY,
+        package_id       TEXT NOT NULL REFERENCES packages(package_id),
+        institution_id   TEXT NOT NULL,
+        reviewer_id      TEXT NOT NULL,
+        status           TEXT NOT NULL,
+        assigned_by      TEXT NOT NULL,
+        assigned_at      TEXT NOT NULL,
+        responded_at     TEXT,
+        completed_at     TEXT,
+        verdict          TEXT,
+        comment          TEXT,
+        deadline_at_utc  TEXT,
+        deadline_timezone TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_requests_reviewer
+        ON requests(reviewer_id, status);
+    CREATE INDEX IF NOT EXISTS idx_requests_package ON requests(package_id);
+
+    CREATE TABLE IF NOT EXISTS objections (
+        objection_id  TEXT PRIMARY KEY,
+        request_id    TEXT NOT NULL REFERENCES requests(request_id),
+        package_id    TEXT NOT NULL REFERENCES packages(package_id),
+        institution_id TEXT NOT NULL,
+        reviewer_id   TEXT NOT NULL,
+        category      TEXT NOT NULL,
+        detail        TEXT NOT NULL,
+        created_at    TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS audit_log (
+        audit_id       TEXT PRIMARY KEY,
+        package_id     TEXT,
+        institution_id TEXT,
+        actor_id       TEXT NOT NULL,
+        action         TEXT NOT NULL,
+        at             TEXT NOT NULL,
+        detail_json    TEXT NOT NULL DEFAULT '{}'
+    );
+
+    CREATE TABLE IF NOT EXISTS idempotency (
+        idempotency_key TEXT PRIMARY KEY,
+        result_json     TEXT NOT NULL,
+        created_at      TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS api_tokens (
+        token       TEXT PRIMARY KEY,
+        user_id     TEXT NOT NULL REFERENCES users(user_id),
+        created_at  TEXT NOT NULL
+    );
+
+    PRAGMA user_version = 1;
+"""
+
+# 规则策略：版本保留规则顺序（position）与依赖（strategy_rule_deps）。
+_SCHEMA_V2 = """
+    CREATE TABLE IF NOT EXISTS strategies (
+        strategy_id    TEXT PRIMARY KEY,
+        institution_id TEXT NOT NULL,
+        name           TEXT NOT NULL,
+        created_by     TEXT NOT NULL,
+        created_at     TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS strategy_versions (
+        version_id            TEXT PRIMARY KEY,
+        strategy_id           TEXT NOT NULL REFERENCES strategies(strategy_id),
+        institution_id        TEXT NOT NULL,
+        version_no            INTEGER NOT NULL,
+        supersedes_version_id TEXT,
+        created_by            TEXT NOT NULL,
+        created_at            TEXT NOT NULL,
+        UNIQUE(strategy_id, version_no)
+    );
+
+    CREATE TABLE IF NOT EXISTS strategy_rules (
+        version_id   TEXT NOT NULL REFERENCES strategy_versions(version_id),
+        rule_key     TEXT NOT NULL,
+        position     INTEGER NOT NULL,
+        content_json TEXT NOT NULL,
+        PRIMARY KEY(version_id, rule_key),
+        UNIQUE(version_id, position)
+    );
+
+    CREATE TABLE IF NOT EXISTS strategy_rule_deps (
+        version_id     TEXT NOT NULL,
+        rule_key       TEXT NOT NULL,
+        depends_on_key TEXT NOT NULL,
+        PRIMARY KEY(version_id, rule_key, depends_on_key),
+        FOREIGN KEY(version_id, rule_key)
+            REFERENCES strategy_rules(version_id, rule_key)
+    );
+
+    CREATE TABLE IF NOT EXISTS strategy_cases (
+        case_id        TEXT PRIMARY KEY,
+        strategy_id    TEXT NOT NULL REFERENCES strategies(strategy_id),
+        institution_id TEXT NOT NULL,
+        version_id     TEXT NOT NULL REFERENCES strategy_versions(version_id),
+        decided_by     TEXT NOT NULL,
+        decided_at     TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_strategy_cases_version
+        ON strategy_cases(version_id);
+
+    CREATE TABLE IF NOT EXISTS strategy_case_rules (
+        case_id  TEXT NOT NULL REFERENCES strategy_cases(case_id),
+        rule_key TEXT NOT NULL,
+        PRIMARY KEY(case_id, rule_key)
+    );
+
+    PRAGMA user_version = 2;
+"""
 
 
 class SqliteRepository(Repository):
@@ -49,136 +240,11 @@ class SqliteRepository(Repository):
     # ---------------------------------------------------------------- schema
     def _ensure_schema(self) -> None:
         version = self._conn.execute("PRAGMA user_version").fetchone()[0]
-        if version >= SCHEMA_VERSION:
-            return
-        # executescript 会自行提交事务；把 user_version 写入放在同一脚本
-        self._conn.executescript(
-            """
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id        TEXT PRIMARY KEY,
-                    institution_id TEXT,
-                    roles_json     TEXT NOT NULL,
-                    display_name   TEXT NOT NULL DEFAULT ''
-                );
-
-                CREATE TABLE IF NOT EXISTS blobs (
-                    sha256     TEXT PRIMARY KEY,
-                    data       BLOB NOT NULL,
-                    media_type TEXT NOT NULL,
-                    size       INTEGER NOT NULL,
-                    created_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS materials (
-                    material_id        TEXT PRIMARY KEY,
-                    institution_id     TEXT NOT NULL,
-                    kind               TEXT NOT NULL,
-                    sensitivity        TEXT NOT NULL,
-                    title              TEXT NOT NULL,
-                    current_version_id TEXT,
-                    withdrawn          INTEGER NOT NULL DEFAULT 0,
-                    created_at         TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS versions (
-                    version_id              TEXT PRIMARY KEY,
-                    material_id             TEXT NOT NULL REFERENCES materials(material_id),
-                    institution_id          TEXT NOT NULL,
-                    sha256                  TEXT NOT NULL,
-                    size                    INTEGER NOT NULL,
-                    media_type              TEXT NOT NULL,
-                    version_no              INTEGER NOT NULL,
-                    supersedes_version_id   TEXT,
-                    created_by              TEXT NOT NULL,
-                    created_at              TEXT NOT NULL,
-                    withdrawn               INTEGER NOT NULL DEFAULT 0,
-                    withdrawn_at            TEXT,
-                    UNIQUE(material_id, version_no)
-                );
-
-                CREATE TABLE IF NOT EXISTS packages (
-                    package_id            TEXT PRIMARY KEY,
-                    institution_id        TEXT NOT NULL,
-                    title                 TEXT NOT NULL,
-                    status                TEXT NOT NULL,
-                    created_by            TEXT NOT NULL,
-                    created_at            TEXT NOT NULL,
-                    sealed_at             TEXT,
-                    manifest_fingerprint  TEXT,
-                    decided_at            TEXT,
-                    decision              TEXT,
-                    decision_note         TEXT,
-                    review_fingerprint    TEXT,
-                    supersedes_package_id TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS entries (
-                    entry_id    TEXT PRIMARY KEY,
-                    package_id  TEXT NOT NULL REFERENCES packages(package_id),
-                    material_id TEXT NOT NULL,
-                    version_id  TEXT NOT NULL REFERENCES versions(version_id),
-                    sha256      TEXT NOT NULL,
-                    kind        TEXT NOT NULL,
-                    sensitivity TEXT NOT NULL,
-                    added_at    TEXT NOT NULL,
-                    UNIQUE(package_id, version_id)
-                );
-
-                CREATE TABLE IF NOT EXISTS requests (
-                    request_id       TEXT PRIMARY KEY,
-                    package_id       TEXT NOT NULL REFERENCES packages(package_id),
-                    institution_id   TEXT NOT NULL,
-                    reviewer_id      TEXT NOT NULL,
-                    status           TEXT NOT NULL,
-                    assigned_by      TEXT NOT NULL,
-                    assigned_at      TEXT NOT NULL,
-                    responded_at     TEXT,
-                    completed_at     TEXT,
-                    verdict          TEXT,
-                    comment          TEXT,
-                    deadline_at_utc  TEXT,
-                    deadline_timezone TEXT
-                );
-                CREATE INDEX IF NOT EXISTS idx_requests_reviewer
-                    ON requests(reviewer_id, status);
-                CREATE INDEX IF NOT EXISTS idx_requests_package ON requests(package_id);
-
-                CREATE TABLE IF NOT EXISTS objections (
-                    objection_id  TEXT PRIMARY KEY,
-                    request_id    TEXT NOT NULL REFERENCES requests(request_id),
-                    package_id    TEXT NOT NULL REFERENCES packages(package_id),
-                    institution_id TEXT NOT NULL,
-                    reviewer_id   TEXT NOT NULL,
-                    category      TEXT NOT NULL,
-                    detail        TEXT NOT NULL,
-                    created_at    TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS audit_log (
-                    audit_id       TEXT PRIMARY KEY,
-                    package_id     TEXT,
-                    institution_id TEXT,
-                    actor_id       TEXT NOT NULL,
-                    action         TEXT NOT NULL,
-                    at             TEXT NOT NULL,
-                    detail_json    TEXT NOT NULL DEFAULT '{}'
-                );
-
-                CREATE TABLE IF NOT EXISTS idempotency (
-                    idempotency_key TEXT PRIMARY KEY,
-                    result_json     TEXT NOT NULL,
-                    created_at      TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS api_tokens (
-                    token       TEXT PRIMARY KEY,
-                    user_id     TEXT NOT NULL REFERENCES users(user_id),
-                    created_at  TEXT NOT NULL
-                );
-
-                PRAGMA user_version = 1;
-            """
-        )
+        if version < 1:
+            # executescript 会自行提交事务；把 user_version 写入放在同一脚本
+            self._conn.executescript(_SCHEMA_V1)
+        if version < 2:
+            self._conn.executescript(_SCHEMA_V2)
 
     @contextlib.contextmanager
     def _txn_direct(self) -> Iterator[None]:
@@ -666,6 +732,164 @@ class SqliteRepository(Repository):
             )
             for r in rows
         ]
+
+    # ------------------------------------------------------------- strategies
+    def insert_strategy(self, strategy: RuleStrategy) -> None:
+        self._conn.execute(
+            "INSERT INTO strategies(strategy_id, institution_id, name, created_by,"
+            " created_at) VALUES(?,?,?,?,?)",
+            (
+                strategy.strategy_id,
+                strategy.institution_id,
+                strategy.name,
+                strategy.created_by,
+                strategy.created_at,
+            ),
+        )
+
+    def get_strategy(self, strategy_id: str) -> RuleStrategy | None:
+        row = self._conn.execute(
+            "SELECT * FROM strategies WHERE strategy_id = ?", (strategy_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return RuleStrategy(
+            strategy_id=row["strategy_id"],
+            institution_id=row["institution_id"],
+            name=row["name"],
+            created_by=row["created_by"],
+            created_at=row["created_at"],
+        )
+
+    def insert_strategy_version(self, version: StrategyVersion) -> None:
+        self._conn.execute(
+            "INSERT INTO strategy_versions(version_id, strategy_id, institution_id,"
+            " version_no, supersedes_version_id, created_by, created_at)"
+            " VALUES(?,?,?,?,?,?,?)",
+            (
+                version.version_id,
+                version.strategy_id,
+                version.institution_id,
+                version.version_no,
+                version.supersedes_version_id,
+                version.created_by,
+                version.created_at,
+            ),
+        )
+        for rule in version.rules:
+            self._conn.execute(
+                "INSERT INTO strategy_rules(version_id, rule_key, position,"
+                " content_json) VALUES(?,?,?,?)",
+                (
+                    version.version_id,
+                    rule.rule_key,
+                    rule.position,
+                    json.dumps(rule.content, ensure_ascii=False, sort_keys=True),
+                ),
+            )
+            for dep in rule.depends_on:
+                self._conn.execute(
+                    "INSERT INTO strategy_rule_deps(version_id, rule_key,"
+                    " depends_on_key) VALUES(?,?,?)",
+                    (version.version_id, rule.rule_key, dep),
+                )
+
+    def _load_strategy_rules(self, version_id: str) -> tuple[StrategyRule, ...]:
+        rows = self._conn.execute(
+            "SELECT * FROM strategy_rules WHERE version_id = ? ORDER BY position",
+            (version_id,),
+        ).fetchall()
+        deps: dict[str, list[str]] = {}
+        for d in self._conn.execute(
+            "SELECT rule_key, depends_on_key FROM strategy_rule_deps"
+            " WHERE version_id = ? ORDER BY depends_on_key",
+            (version_id,),
+        ):
+            deps.setdefault(d["rule_key"], []).append(d["depends_on_key"])
+        return tuple(
+            StrategyRule(
+                rule_key=r["rule_key"],
+                position=r["position"],
+                content=json.loads(r["content_json"]),
+                depends_on=tuple(deps.get(r["rule_key"], ())),
+            )
+            for r in rows
+        )
+
+    def _row_to_strategy_version(self, row: sqlite3.Row) -> StrategyVersion:
+        return StrategyVersion(
+            version_id=row["version_id"],
+            strategy_id=row["strategy_id"],
+            institution_id=row["institution_id"],
+            version_no=row["version_no"],
+            supersedes_version_id=row["supersedes_version_id"],
+            created_by=row["created_by"],
+            created_at=row["created_at"],
+            rules=self._load_strategy_rules(row["version_id"]),
+        )
+
+    def get_strategy_version(self, version_id: str) -> StrategyVersion | None:
+        row = self._conn.execute(
+            "SELECT * FROM strategy_versions WHERE version_id = ?", (version_id,)
+        ).fetchone()
+        return None if row is None else self._row_to_strategy_version(row)
+
+    def list_strategy_versions(self, strategy_id: str) -> list[StrategyVersion]:
+        rows = self._conn.execute(
+            "SELECT * FROM strategy_versions WHERE strategy_id = ?"
+            " ORDER BY version_no",
+            (strategy_id,),
+        ).fetchall()
+        return [self._row_to_strategy_version(r) for r in rows]
+
+    def insert_strategy_case(self, case: StrategyCase) -> None:
+        self._conn.execute(
+            "INSERT INTO strategy_cases(case_id, strategy_id, institution_id,"
+            " version_id, decided_by, decided_at) VALUES(?,?,?,?,?,?)",
+            (
+                case.case_id,
+                case.strategy_id,
+                case.institution_id,
+                case.version_id,
+                case.decided_by,
+                case.decided_at,
+            ),
+        )
+        for rule_key in case.matched_rule_keys:
+            self._conn.execute(
+                "INSERT INTO strategy_case_rules(case_id, rule_key) VALUES(?,?)",
+                (case.case_id, rule_key),
+            )
+
+    def _row_to_strategy_case(self, row: sqlite3.Row) -> StrategyCase:
+        keys = self._conn.execute(
+            "SELECT rule_key FROM strategy_case_rules WHERE case_id = ?"
+            " ORDER BY rule_key",
+            (row["case_id"],),
+        ).fetchall()
+        return StrategyCase(
+            case_id=row["case_id"],
+            strategy_id=row["strategy_id"],
+            institution_id=row["institution_id"],
+            version_id=row["version_id"],
+            matched_rule_keys=tuple(k["rule_key"] for k in keys),
+            decided_by=row["decided_by"],
+            decided_at=row["decided_at"],
+        )
+
+    def get_strategy_case(self, case_id: str) -> StrategyCase | None:
+        row = self._conn.execute(
+            "SELECT * FROM strategy_cases WHERE case_id = ?", (case_id,)
+        ).fetchone()
+        return None if row is None else self._row_to_strategy_case(row)
+
+    def list_cases_by_version(self, version_id: str) -> list[StrategyCase]:
+        rows = self._conn.execute(
+            "SELECT * FROM strategy_cases WHERE version_id = ?"
+            " ORDER BY decided_at, case_id",
+            (version_id,),
+        ).fetchall()
+        return [self._row_to_strategy_case(r) for r in rows]
 
 
 def _row_to_user(row: sqlite3.Row) -> User:
